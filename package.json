@@ -1,6 +1,6 @@
 {
   "name": "@nodana/phoenixd-mpp-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Phoenixd Lightning payment methods for the Machine Payments Protocol",
   "type": "module",
   "license": "MIT",
