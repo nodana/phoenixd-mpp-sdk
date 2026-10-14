@@ -65,17 +65,18 @@ Use Redis persistence appropriate for payment state, with `noeviction`, sufficie
 
 ## Release
 
-The only GitHub Actions workflow is `.github/workflows/npm-publish.yml`. It runs on pushed version tags (`v*.*.*`), checks the package version, runs the build and tests including Redis integration, and publishes through npm trusted publishing with provenance. Branch pushes and pull requests do not trigger Actions.
+Publishing a GitHub Release triggers `.github/workflows/npm-publish.yml`. Pushes to branches or tags, pull requests, draft releases and release-note edits do not trigger publication.
 
-For the first release, publish `@nodana/phoenixd-ts` 0.2.0 first, run `npm install` here to update the lockfile, then authenticate with `npm login` and run `npm publish --access public`. The publish command runs `npm test` through `prepublishOnly`.
+1. Update the version in `package.json` and `package-lock.json`, for example with `npm version patch --no-git-tag-version`.
+2. Commit and push the version change and release code to `main`.
+3. In GitHub, open **Releases → Draft a new release**. Create a tag matching the package version exactly, such as `v0.1.1`, targeting the release commit on `main`.
+4. Add the release title and notes, then click **Publish release**.
+5. Check the **Publish to npm** workflow. It validates the release tag and both manifest versions, installs dependencies, runs the checks, and publishes the tagged code to npm with provenance. Its summary reports whether publication succeeded.
 
-After the first publication, configure the package's npm trusted publisher for GitHub organisation `nodana`, repository `phoenixd-mpp-sdk`, workflow `npm-publish.yml`, no environment, with direct `npm publish` allowed.
+The npm trusted publisher must point to organisation `nodana`, repository `phoenixd-mpp-sdk`, workflow `npm-publish.yml`, with no environment and direct publishing allowed. The source repository must be public for npm provenance. Stable releases publish to the `latest` npm dist-tag; GitHub prereleases publish to `next`.
 
-For subsequent releases, update the package version and lockfile, commit and push, then create and push the matching version tag. For example, release 0.1.1 with:
+The workflow checks and builds before publishing, then uses `--ignore-scripts` to avoid running `prepublishOnly` a second time. Manual `npm publish` still runs the full test/build hook. Test results remain in the logs; the Actions summary reports the release outcome.
 
-```sh
-git tag -a v0.1.1 -m "Release v0.1.1"
-git push origin v0.1.1
-```
+npm versions cannot be overwritten. If a release fails before publication, fix the cause before retrying. For versions already on npm, create a GitHub Release from the tag matching their original source commit rather than publishing the package again.
 
-Do not trigger the release workflow for a version already published manually: npm versions cannot be overwritten. Inspect `npm pack --dry-run` before releasing. The package includes declarations, JavaScript builds, source maps, README, licence and attribution.
+When retrying an unpublished version after changing the workflow or code, its tag must include those fixes. Commit and push the fixes first, then replace the failed tag before creating the GitHub Release. Do not move a tag for a version already published to npm.

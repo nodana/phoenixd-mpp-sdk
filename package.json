@@ -51,10 +51,10 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --reporter=default",
     "test": "npm run typecheck && npm run test:unit && npm run build && node tests/package-smoke.mjs",
     "prepublishOnly": "npm test",
-    "test:redis": "vitest run --config vitest.redis.config.ts"
+    "test:redis": "vitest run --config vitest.redis.config.ts --reporter=default"
   },
   "peerDependencies": {
     "@nodana/phoenixd-ts": "^0.2.0",
