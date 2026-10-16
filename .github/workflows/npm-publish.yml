@@ -55,12 +55,6 @@ jobs:
       - name: Build and test
         run: npm test
 
-      - name: Install Redis test tools
-        run: sudo apt-get update && sudo apt-get install -y redis-server redis-tools
-
-      - name: Test Redis integration
-        run: npm run test:redis
-
       - name: Publish package
         id: publish
         env:

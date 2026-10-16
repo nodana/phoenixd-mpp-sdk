@@ -17,6 +17,8 @@ export const charge = Method.from({
       description: z.optional(z.string()),
       methodDetails: z.object({
         invoice: z.string(),
+        requestBinding: z.optional(z.string().check(z.regex(/^[0-9a-f]{64}$/))),
+        expiresAt: z.optional(z.number()),
         paymentHash: z.optional(z.string().check(z.regex(/^[0-9a-f]{64}$/))),
         network: z.optional(z.enum(["mainnet", "regtest", "signet"])),
       }),

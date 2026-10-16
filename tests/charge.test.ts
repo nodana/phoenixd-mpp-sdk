@@ -1,291 +1,200 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Challenge, Credential, Receipt } from "mppx";
-import { Mppx, phoenixd, memoryStore } from "../src/server";
-import { charge as clientCharge } from "../src/client/charge";
-import type { ChargeStore } from "../src/server";
-import { fakeNode } from "./helpers";
-
+import { afterEach, expect, it, vi } from "vitest";
+import { Challenge, Credential, Receipt, Errors } from "mppx";
+import { Mppx, phoenixd } from "../src";
+import { fakeNode, fixtureWallet } from "./helpers";
 const secretKey = "a".repeat(64);
+const endpoint = "https://api.example.test/query";
+const input = (credential?: string, url = endpoint, body = "question") =>
+  new Request(url, {
+    method: "POST",
+    body,
+    ...(credential ? { headers: { Authorization: credential } } : {}),
+  });
+function configure(node = fakeNode()) {
+  const method = phoenixd.charge({ client: node });
+  const sdk = Mppx.create({ methods: [method], secretKey });
+  return { node, method, sdk, handler: sdk.charge({ amount: "100" }) };
+}
+async function setup() {
+  const config = configure();
+  const result = await config.handler(input());
+  if (result.status !== 402) throw new Error("Expected challenge");
+  const wallet = fixtureWallet(config.node);
+  const challenge = Challenge.fromResponse(result.challenge, {
+    methods: [wallet],
+  });
+  const credential = await wallet.createCredential({ challenge });
+  return { ...config, result, challenge, credential };
+}
+afterEach(() => vi.restoreAllMocks());
 
-const endpoint = "https://api.example.test/weather";
+it("uses request and verify hooks to issue a standard challenge and receipt without another invoice on retry", async () => {
+  const { node, method, result, handler, challenge, credential } =
+    await setup();
+  expect(typeof method.request).toBe("function");
+  expect(typeof method.verify).toBe("function");
+  expect(result.challenge.headers.get("Cache-Control")).toBe("no-store");
+  expect(Challenge.verify(challenge, { secretKey })).toBe(true);
+  const paid = await handler(input(credential));
+  expect(paid.status).toBe(200);
+  if (paid.status !== 200) return;
+  const response = paid.withReceipt(Response.json({ result: "paid" }));
+  const receipt = Receipt.fromResponse(response);
+  expect(receipt.reference).toBe(challenge.request.methodDetails.paymentHash);
+  expect(response.headers.get("Payment-Receipt")).not.toContain(
+    node.invoices.get("lnbc-fixture-1")!.preimage,
+  );
+  expect(node.createInvoice).toHaveBeenCalledTimes(1);
+  expect(node.decodeInvoice).toHaveBeenCalledTimes(1);
+});
 
-function setup(store: ChargeStore = memoryStore()) {
+it("does not retain payment usage and verifies across independent instances", async () => {
+  const { node, handler, credential } = await setup();
+  const other = configure(node).handler;
+  expect(
+    (
+      await Promise.all([handler(input(credential)), other(input(credential))])
+    ).map((r) => r.status),
+  ).toEqual([200, 200]);
+  expect(node.createInvoice).toHaveBeenCalledTimes(1);
+});
+
+it("lets application code save original challenges and atomically redeem them by extending verify", async () => {
   const node = fakeNode();
-  const mpp = Mppx.create({
-    methods: [phoenixd.charge({ client: node, store })],
+  const base = phoenixd.charge({ client: node });
+  const records = new Map<string, { serialized: string; used: boolean }>();
+  const sdk = Mppx.create({
+    methods: [
+      {
+        ...base,
+        async verify(context: Parameters<typeof base.verify>[0]) {
+          const receipt = await base.verify(context);
+          const saved = records.get(context.credential.challenge.id);
+          if (
+            !saved ||
+            saved.used ||
+            saved.serialized !==
+              Challenge.serialize(context.credential.challenge)
+          )
+            throw new Errors.PaymentRequiredError();
+          saved.used = true;
+          return receipt;
+        },
+      },
+    ],
     secretKey,
   });
-  const method = clientCharge({ client: node, maxAmountSat: 1000 });
-  const handler = mpp.charge({ amount: "100", description: "Weather report" });
-
-  const request = (credential?: string, url = endpoint, body?: string) =>
-    new Request(url, {
-      ...(body === undefined ? {} : { method: "POST", body }),
-      ...(credential === undefined
-        ? {}
-        : { headers: { Authorization: credential } }),
-    });
-
-  const issue = async (input = request()) => {
-    const result = await handler(input);
-
-    if (result.status !== 402) throw new Error("Expected payment challenge");
-
-    return {
-      response: result.challenge,
-      challenge: Challenge.fromResponse(result.challenge, {
-        methods: [method],
-      }),
-    };
+  const handler = async (request: Request) => {
+    const result = await sdk.charge({ amount: "100" })(request);
+    if (result.status === 402) {
+      const challenge = Challenge.fromResponse(result.challenge);
+      records.set(challenge.id, {
+        serialized: Challenge.serialize(challenge),
+        used: false,
+      });
+    }
+    return result;
   };
-
-  return { node, mpp, method, handler, request, issue, store };
-}
-
-beforeEach(() => vi.restoreAllMocks());
-
-describe("Lightning charge HTTP flow", () => {
-  it("issues, pays, serves and returns a receipt without an extra invoice on retry", async () => {
-    const { node, handler, request, issue, method } = setup();
-    const { response, challenge } = await issue();
-
-    expect(response.status).toBe(402);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
-    expect(challenge.method).toBe("lightning");
-    expect(challenge.request.amount).toBe("100");
-    expect(challenge.request.methodDetails.invoice).toBe("lnbc-fixture-1");
-    expect(Challenge.verify(challenge, { secretKey })).toBe(true);
-    expect(node.createInvoice).toHaveBeenCalledWith({
-      amountSat: 100,
-      description: "Weather report",
-      expirySeconds: 3600,
-    });
-
-    const credential = await method.createCredential({ challenge });
-    const result = await handler(request(credential));
-
-    expect(result.status).toBe(200);
-
-    if (result.status !== 200) return;
-
-    const paid = result.withReceipt(Response.json({ weather: "sunny" }));
-
-    expect(await paid.json()).toEqual({ weather: "sunny" });
-
-    const receipt = Receipt.fromResponse(paid);
-
-    expect(receipt.reference).toBe(challenge.request.methodDetails.paymentHash);
-    expect(receipt.status).toBe("success");
-    expect(paid.headers.get("Cache-Control")).toBe("no-store");
-    expect(paid.headers.get("Payment-Receipt")).not.toContain(
-      node.invoices.get("lnbc-fixture-1")!.preimage,
-    );
-    expect(node.createInvoice).toHaveBeenCalledTimes(1);
-    expect(node.payInvoice).toHaveBeenCalledTimes(1);
+  const offered = await handler(input());
+  if (offered.status !== 402) throw new Error("Expected challenge");
+  const wallet = fixtureWallet(node);
+  const credential = await wallet.createCredential({
+    challenge: Challenge.fromResponse(offered.challenge, { methods: [wallet] }),
   });
+  const results = await Promise.all([
+    handler(input(credential)),
+    handler(input(credential)),
+  ]);
+  expect(results.map((r) => r.status).sort()).toEqual([200, 402]);
+  expect(node.createInvoice).toHaveBeenCalledTimes(2);
+});
 
-  it("emits the actual issued challenge through lifecycle events", async () => {
-    const { mpp, issue } = setup();
-    const onCreated = vi.fn();
+it("emits the actual issued challenge for application recording", async () => {
+  const { sdk, handler } = configure();
+  const created = vi.fn();
+  sdk.onChallengeCreated(created);
+  const result = await handler(input());
+  if (result.status !== 402) throw new Error("Expected challenge");
+  expect(created.mock.calls[0]![0].challenge.id).toBe(
+    Challenge.fromResponse(result.challenge).id,
+  );
+});
 
-    mpp.onChallengeCreated(onCreated);
+it("rejects different URLs, methods, bodies and prices", async () => {
+  const { handler, sdk, credential } = await setup();
+  expect((await handler(input(credential, endpoint + "?other=1"))).status).toBe(
+    402,
+  );
+  expect((await handler(input(credential, endpoint, "different"))).status).toBe(
+    402,
+  );
+  expect(
+    (
+      await handler(
+        new Request(endpoint, { headers: { Authorization: credential } }),
+      )
+    ).status,
+  ).toBe(402);
+  expect((await sdk.charge({ amount: "200" })(input(credential))).status).toBe(
+    402,
+  );
+});
 
-    const { challenge } = await issue();
-
-    expect(onCreated).toHaveBeenCalledOnce();
-    expect(onCreated.mock.calls[0]![0].challenge.id).toBe(challenge.id);
-    expect(onCreated.mock.calls[0]![0].request.methodDetails.invoice).toBe(
-      challenge.request.methodDetails.invoice,
-    );
+it("rejects wrong proofs and forged challenges and supplies a new invoice", async () => {
+  const { handler, challenge, credential, node } = await setup();
+  const wrong = Credential.serialize({
+    challenge,
+    payload: { preimage: "0".repeat(64) },
   });
-
-  it("accepts exactly one of two concurrent uses and gives the rejected use a fresh invoice", async () => {
-    const { handler, request, issue, method } = setup();
-    const { challenge } = await issue();
-    const credential = await method.createCredential({ challenge });
-    const results = await Promise.all([
-      handler(request(credential)),
-      handler(request(credential)),
-    ]);
-
-    expect(results.map((r) => r.status).sort()).toEqual([200, 402]);
-
-    const rejected = results.find((r) => r.status === 402)!;
-
-    if (rejected.status !== 402) return;
-
-    const fresh = Challenge.fromResponse(rejected.challenge, {
-      methods: [method],
-    });
-
-    expect(fresh.request.methodDetails.paymentHash).not.toBe(
-      challenge.request.methodDetails.paymentHash,
-    );
-
-    const next = await handler(
-      request(await method.createCredential({ challenge: fresh })),
-    );
-
-    expect(next.status).toBe(200);
+  const invalid = await handler(input(wrong));
+  expect(invalid.status).toBe(402);
+  if (invalid.status !== 402) return;
+  expect(Challenge.fromResponse(invalid.challenge).id).not.toBe(challenge.id);
+  const forged = Credential.serialize({
+    challenge: { ...challenge, id: "forged" },
+    payload: Credential.deserialize(credential).payload,
   });
+  expect((await handler(input(forged))).status).toBe(402);
+  expect(node.createInvoice).toHaveBeenCalledTimes(3);
+});
 
-  it("rejects a wrong preimage and permits paying its fresh challenge", async () => {
-    const { handler, request, issue, method } = setup();
-    const { challenge } = await issue();
-    const invalid = Credential.serialize({
-      challenge,
-      payload: { preimage: "0".repeat(64) },
-    });
-    const result = await handler(request(invalid));
-
-    expect(result.status).toBe(402);
-
-    if (result.status !== 402) return;
-
-    const fresh = Challenge.fromResponse(result.challenge, {
-      methods: [method],
-    });
-
-    expect(fresh.id).not.toBe(challenge.id);
-    expect(
-      (
-        await handler(
-          request(await method.createCredential({ challenge: fresh })),
-        )
-      ).status,
-    ).toBe(200);
+it("caps expiry to the invoice and rejects expired proof", async () => {
+  const node = fakeNode();
+  const sdk = Mppx.create({
+    methods: [phoenixd.charge({ client: node, invoiceExpirySeconds: 5 })],
+    secretKey,
   });
-
-  it("rejects forged challenge data and price changes", async () => {
-    const { handler, mpp, request, issue, method } = setup();
-    const { challenge } = await issue();
-    const credential = await method.createCredential({ challenge });
-
-    expect(
-      (await mpp.charge({ amount: "200" })(request(credential))).status,
-    ).toBe(402);
-
-    const tampered = structuredClone(challenge);
-
-    tampered.request.amount = "1";
-
-    const proof = Credential.deserialize(credential).payload as {
-      preimage: string;
-    };
-
-    expect(
-      (
-        await handler(
-          request(
-            Credential.serialize({ challenge: tampered, payload: proof }),
-          ),
-        )
-      ).status,
-    ).toBe(402);
+  const offered = await sdk.charge({
+    amount: "100",
+    expires: new Date(Date.now() + 3600000),
+  })(input());
+  if (offered.status !== 402) throw new Error("Expected challenge");
+  const wallet = fixtureWallet(node);
+  const challenge = Challenge.fromResponse(offered.challenge, {
+    methods: [wallet],
   });
+  const decoded = await node.decodeInvoice({ invoice: "lnbc-fixture-1" });
+  expect(Date.parse(challenge.expires!)).toBe(
+    (decoded.timestampSeconds + 5) * 1000,
+  );
+  const credential = await wallet.createCredential({ challenge });
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse(challenge.expires!));
+  expect((await sdk.charge({ amount: "100" })(input(credential))).status).toBe(
+    402,
+  );
+});
 
-  it("rejects valid proof on another URL or request body", async () => {
-    const { handler, request, issue, method } = setup();
-    const { challenge } = await issue(request(undefined, endpoint, "original"));
-    const credential = await method.createCredential({ challenge });
-
-    expect(
-      (await handler(request(credential, endpoint, "changed"))).status,
-    ).toBe(402);
-    expect(
-      (
-        await handler(
-          request(credential, "https://api.example.test/other", "original"),
-        )
-      ).status,
-    ).toBe(402);
-    expect(
-      (await handler(request(credential, endpoint, "original"))).status,
-    ).toBe(200);
-  });
-
-  it("caps challenge expiry to the invoice expiry and rejects expired credentials", async () => {
-    const { mpp, request, node, method } = setup();
-    const shortMpp = Mppx.create({
-      methods: [phoenixd.charge({ client: node, invoiceExpirySeconds: 5 })],
-      secretKey,
-    });
-    const result = await shortMpp.charge({
-      amount: "100",
-      expires: new Date(Date.now() + 3_600_000),
-    })(request());
-
-    if (result.status !== 402) throw new Error("Expected challenge");
-
-    const challenge = Challenge.fromResponse(result.challenge, {
-      methods: [method],
-    });
-    const decoded = await node.decodeInvoice({
-      invoice: challenge.request.methodDetails.invoice,
-    });
-
-    expect(Date.parse(challenge.expires!)).toBe(
-      (decoded.timestampSeconds + 5) * 1000,
-    );
-
-    const credential = await method.createCredential({ challenge });
-
-    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
-
-    const rejected = await mpp.charge({ amount: "100" })(request(credential));
-
-    expect(rejected.status).toBe(402);
-  });
-
-  it("rejects unsigned but otherwise matching proofs before accessing the protected result", async () => {
-    const { handler, request, issue, method } = setup();
-    const { challenge } = await issue();
-    const credential = await method.createCredential({ challenge });
-    const proof = Credential.deserialize(credential).payload;
-    const forged = { ...challenge, id: "forged" };
-
-    expect(
-      (
-        await handler(
-          request(Credential.serialize({ challenge: forged, payload: proof })),
-        )
-      ).status,
-    ).toBe(402);
-  });
-
-  it("fails closed when durable issuance or consumption fails", async () => {
-    const store = memoryStore();
-    const { handler, request, issue, method } = setup(store);
-    const { challenge } = await issue();
-    const credential = await method.createCredential({ challenge });
-
-    vi.spyOn(store, "consume").mockRejectedValue(new Error("disk unavailable"));
-
-    const failed = await handler(request(credential));
-
-    expect(failed.status).toBe(402);
-
-    if (failed.status === 402) expect(failed.challenge.status).toBe(503);
-
-    vi.spyOn(store, "issue").mockRejectedValue(new Error("disk unavailable"));
-    await expect(issue()).rejects.toMatchObject({ code: "store_unavailable" });
-  });
-
-  it("rejects malformed credentials and generates a usable replacement", async () => {
-    const { handler, request, method } = setup();
-    const result = await handler(request("Payment nonsense"));
-
-    expect(result.status).toBe(402);
-
-    if (result.status !== 402) return;
-
-    const challenge = Challenge.fromResponse(result.challenge, {
-      methods: [method],
-    });
-
-    expect(
-      (await handler(request(await method.createCredential({ challenge }))))
-        .status,
-    ).toBe(200);
+it("rejects standalone verification and node errors", async () => {
+  const { method, node, challenge } = await setup();
+  await expect(
+    method.verify({
+      credential: { challenge, payload: { preimage: "0".repeat(64) } },
+      request: challenge.request,
+    }),
+  ).rejects.toMatchObject({ code: "invalid_challenge" });
+  node.createInvoice.mockRejectedValueOnce(new Error("offline"));
+  const fresh = configure(node);
+  await expect(fresh.handler(input())).rejects.toMatchObject({
+    code: "invalid_invoice",
   });
 });

@@ -1,7 +1,7 @@
 {
   "name": "@nodana/phoenixd-mpp-sdk",
-  "version": "0.1.1",
-  "description": "Phoenixd Lightning payment methods for the Machine Payments Protocol",
+  "version": "0.2.0",
+  "description": "Accept Lightning payments for API requests using MPP and Phoenixd",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -21,26 +21,6 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
-    },
-    "./server": {
-      "import": {
-        "types": "./dist/server/index.d.ts",
-        "default": "./dist/server/index.js"
-      },
-      "require": {
-        "types": "./dist/server/index.d.cts",
-        "default": "./dist/server/index.cjs"
-      }
-    },
-    "./client": {
-      "import": {
-        "types": "./dist/client/index.d.ts",
-        "default": "./dist/client/index.js"
-      },
-      "require": {
-        "types": "./dist/client/index.d.cts",
-        "default": "./dist/client/index.cjs"
-      }
     }
   },
   "files": [
@@ -53,8 +33,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "test:unit": "vitest run --reporter=default",
     "test": "npm run typecheck && npm run test:unit && npm run build && node tests/package-smoke.mjs",
-    "prepublishOnly": "npm test",
-    "test:redis": "vitest run --config vitest.redis.config.ts --reporter=default"
+    "prepublishOnly": "npm test"
   },
   "peerDependencies": {
     "@nodana/phoenixd-ts": "^0.2.0",

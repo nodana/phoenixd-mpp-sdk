@@ -1,114 +1,85 @@
 # Phoenixd MPP SDK
 
-Accept or send Lightning payments for API requests using the Machine Payments Protocol (MPP) and a Phoenixd node. This package supplies the Phoenixd payment method for `mppx`; `@nodana/phoenixd-ts` connects it to your node.
-
-Use Node.js 22.12 or later. The package provides TypeScript declarations and ESM and CommonJS exports.
+Create Lightning payment challenges and verify payment proofs using Phoenixd and the Machine Payments Protocol. The package supplies a receiving method for `mppx`; your application owns its database records and redemption decisions. Use Node.js 22.12 or later.
 
 ## Install
-
-Install the adapter and its dependencies:
 
 ```sh
 npm install @nodana/phoenixd-mpp-sdk @nodana/phoenixd-ts mppx
 ```
 
-## Accept payment for a request
+## Charge for a request
 
-Configure `PHOENIXD_URL`, `PHOENIXD_PASSWORD` and `MPP_SECRET_KEY` in your service's environment. Use your node's HTTPS endpoint and set `PHOENIXD_PASSWORD` to its restricted password (`http-password-limited-access`). The receiving adapter only creates and decodes invoices; it does not need permission to send payments. Generate a signing secret with `openssl rand -hex 32` and save it in your service's secret configuration. Keep the same secret across instances and restarts.
+Configure `PHOENIXD_URL` and the restricted node password (`http-password-limited-access`) as `PHOENIXD_PASSWORD` in your backend. Generate an application signing secret with `openssl rand -hex 32` and save it as `MPP_SECRET_KEY`. Keep the same secret across instances and deployments.
+
+This example uses application-owned database functions to save issued challenges and redeem them once:
 
 ```ts
+import { Challenge, Errors } from "mppx";
 import { Phoenixd } from "@nodana/phoenixd-ts";
-import { Mppx, phoenixd } from "@nodana/phoenixd-mpp-sdk/server";
+import { Mppx, phoenixd } from "@nodana/phoenixd-mpp-sdk";
+import { db } from "./database"; // Your application's database functions.
 
 const node = new Phoenixd(
   process.env.PHOENIXD_URL!,
   process.env.PHOENIXD_PASSWORD!,
-  { timeoutMs: 15_000 },
 );
+const lightning = phoenixd.charge({ client: node });
 const payments = Mppx.create({
-  methods: [phoenixd.charge({ client: node })],
   secretKey: process.env.MPP_SECRET_KEY!,
+  methods: [
+    {
+      ...lightning,
+      async verify(context: Parameters<typeof lightning.verify>[0]) {
+        const receipt = await lightning.verify(context);
+        const challenge = context.credential.challenge;
+        const accepted = await db.redeemChallengeOnce({
+          id: challenge.id,
+          challenge: Challenge.serialize(challenge),
+          paymentHash: receipt.reference,
+        });
+        if (!accepted) throw new Errors.PaymentRequiredError();
+        return receipt;
+      },
+    },
+  ],
 });
 
 export async function handler(request: Request): Promise<Response> {
-  const payment = await payments.charge({
-    amount: "100",
-    description: "Paid API query",
-  })(request);
-
-  if (payment.status === 402) return payment.challenge;
-
-  // Run your query or tool only after payment is accepted.
+  const payment = await payments.charge({ amount: "100" })(request);
+  if (payment.status === 402) {
+    const challenge = Challenge.fromResponse(payment.challenge);
+    await db.saveChallenge({
+      id: challenge.id,
+      challenge: Challenge.serialize(challenge),
+      expiresAt: Date.parse(challenge.expires!),
+    });
+    return payment.challenge;
+  }
   return payment.withReceipt(Response.json({ answer: "Your paid result" }));
 }
 ```
 
-Mount the handler at your paid endpoint. `amount: '100'` charges 100 satoshis. An unpaid request receives a payment challenge; a paid request receives your result and a receipt.
+Mount the handler at your paid endpoint. `amount: "100"` charges 100 sats. Run the protected operation only after payment verification and successful database redemption.
 
-## Choose payment storage
+## Record and redeem payments
 
-The adapter uses in-memory storage by default, suitable for development. For deployed services, use Redis so every server instance shares payment state. The adapter handles the checks; you supply a connected Redis client.
+Implement `db.saveChallenge` and `db.redeemChallengeOnce` in your application; they are example names for your own database operations.
 
-Install the Redis client if your application does not already use it:
+- Save the exact issued challenge and its expiry before returning the `402` response.
+- When redeeming, compare the echoed challenge to the saved original and check that it is unexpired and unused.
+- Atomically mark it used and record its payment hash with a uniqueness constraint. Concurrent requests must yield exactly one successful redemption.
+- Return `false` for an unknown, expired, mismatched or used challenge. Throw on database errors and stop the request without serving the protected result.
 
-```sh
-npm install redis
-```
+The SDK verifies the signed challenge, request binding, current price, expiry and payment proof. Successful verification does not mean the application has accepted or recorded the payment. MPP Lightning charges require application-side challenge records and single-use redemption; configure these before serving paid requests.
 
-```ts
-import { createClient } from "redis";
-import { redisStore } from "@nodana/phoenixd-mpp-sdk/server";
+Keep redemption records for at least the challenge lifetime. If the protected operation fails after redemption, handle recovery in your application. Verification and delivery are separate steps.
 
-const redis = createClient({ url: process.env.REDIS_URL! });
-redis.on("error", () => console.error("Redis connection error"));
-await redis.connect();
+## Configure invoices and expiry
 
-const payments = Mppx.create({
-  methods: [phoenixd.charge({ client: node, store: redisStore(redis) })],
-  secretKey: process.env.MPP_SECRET_KEY!,
-});
-```
+`phoenixd.charge` accepts a configured Phoenixd `client`, optional `invoiceExpirySeconds` (default 3600), and an optional expected `network` (`mainnet`, `regtest` or `signet`). Prices are positive integer strings in satoshis.
 
-Reuse your existing connected client if you have one. Use the same persistent Redis service and signing secret across your server instances. Expired payment records are removed automatically.
-
-If several services share Redis, choose a namespace with `redisStore(redis, { keyPrefix: 'my-api' })` and use it consistently across that service's instances.
-
-## Pay for a request
-
-Run the payer in a backend or a trusted Node.js application with its own funded Phoenixd node. Set its `PHOENIXD_PASSWORD` to the full-access password (`http-password`), since paying invoices requires spending permission. `maxAmountSat` is required and limits the invoice amount for each challenge; routing fees are additional.
-
-```ts
-import { Phoenixd } from "@nodana/phoenixd-ts";
-import { Mppx, phoenixd } from "@nodana/phoenixd-mpp-sdk/client";
-
-const node = new Phoenixd(
-  process.env.PHOENIXD_URL!,
-  process.env.PHOENIXD_PASSWORD!,
-  { timeoutMs: 15_000 },
-);
-const payments = Mppx.create({
-  methods: [phoenixd.charge({ client: node, maxAmountSat: 100 })],
-  polyfill: false,
-});
-
-const response = await payments.fetch("https://api.example.com/query");
-if (!response.ok) throw new Error(`API request failed: ${response.status}`);
-console.log(await response.json());
-```
-
-`payments.fetch` pays a supported challenge within the limit and retries the request. Choose a limit appropriate for the API you are calling. Keep Phoenixd credentials in your backend; they allow spending from the node. Use HTTPS for paid endpoints.
-
-## Configure a charge
-
-| Option                 | Server                                                                 | Client                                                         |
-| ---------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `client`               | Configured Phoenixd client for creating and decoding invoices          | Configured client for decoding, paying and looking up payments |
-| `store`                | `redisStore(redis)` for shared state; defaults to process-local memory | —                                                              |
-| `invoiceExpirySeconds` | Invoice lifetime; defaults to 3600 seconds                             | —                                                              |
-| `network`              | Optional expected invoice network                                      | Expected network; defaults to `mainnet`                        |
-| `maxAmountSat`         | —                                                                      | Required maximum invoice amount per challenge                  |
-
-Set the challenge expiry on the handler when needed:
+Set a shorter challenge deadline on the handler:
 
 ```ts
 const payment = await payments.charge({
@@ -117,32 +88,21 @@ const payment = await payments.charge({
 })(request);
 ```
 
-The challenge expires no later than its invoice. Use `network: 'regtest'` on both payment methods when testing with regtest nodes.
+The challenge expires no later than its invoice. A retry must use the same URL, HTTP method and body. Keep your application's normal authentication and permissions checks.
 
 ## Troubleshoot
 
-Probe an endpoint without paying:
+Probe an endpoint without paying with `curl -i https://api.example.com/query`. Expect HTTP `402` and a `WWW-Authenticate: Payment` header.
 
-```sh
-curl -i https://api.example.com/query
-```
+- **Invoice creation fails:** check the node URL, restricted password, balance/node status and expected network. Handle `ChargeError` with code `invalid_invoice` as a service error.
+- **Proof is rejected:** check the current price, challenge expiry, request URL, method and body, and that the application instances use the same signing secret.
+- **A valid payment cannot be redeemed:** check the application's issued challenge and redemption records. A previously used payment cannot fund another request.
 
-Expect HTTP `402` and a `WWW-Authenticate: Payment` header. Server failures creating invoices or accessing storage must be caught by your application's error handling; respond with a service error and keep the paid result behind the payment check.
-
-Client errors expose a `code` through `PhoenixdPaymentError`, exported from the client entry point:
-
-| Code              | Action                                                                              |
-| ----------------- | ----------------------------------------------------------------------------------- |
-| `amount_limit`    | Check the endpoint's price and your configured limit.                               |
-| `invalid_invoice` | Check the invoice amount, expiry and network. Request a fresh challenge if expired. |
-| `payment_failed`  | Check your node balance and outgoing payment history.                               |
-| `payment_unknown` | Check outgoing payment history before trying again; the payment may have succeeded. |
-
-If a paid request is rejected, check that you retried the same URL, method and body before expiry. A credential authorises one request. Check that all server instances use the same signing secret and storage.
+Use HTTPS and keep node credentials and payment preimages out of logs.
 
 ## Reference
 
-- [MPP overview](https://mpp.dev/overview)
-- [mppx SDK](https://mpp.dev/sdk/typescript)
+- [Custom MPP methods](https://mpp.dev/payment-methods/custom)
+- [Lightning charge draft](https://paymentauth.org/draft-lightning-charge-00.html)
 - [Phoenixd HTTP API](https://phoenix.acinq.co/server/api)
-- [Development and storage integration](docs/development.md)
+- [Development](docs/development.md)

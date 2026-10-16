@@ -1,3 +1,5 @@
+import { Credential, Method } from "mppx";
+import * as Methods from "../src/Methods";
 import { createHash } from "node:crypto";
 import { vi } from "vitest";
 import type {
@@ -48,9 +50,6 @@ export function fakeNode() {
 
       return structuredClone(value.decoded);
     });
-  const getOutgoingPaymentByHash = vi
-    .fn<PhoenixdClient["getOutgoingPaymentByHash"]>()
-    .mockResolvedValue(null);
   const payInvoice = vi
     .fn<PhoenixdClient["payInvoice"]>()
     .mockImplementation(async ({ invoice }) => {
@@ -69,8 +68,24 @@ export function fakeNode() {
   return {
     createInvoice,
     decodeInvoice,
-    getOutgoingPaymentByHash,
     payInvoice,
     invoices,
   };
+}
+
+/** Simulate a wallet paying a challenge; no Phoenixd payer is shipped by the SDK. */
+export function fixtureWallet(node: ReturnType<typeof fakeNode>) {
+  return Method.toClient(Methods.charge, {
+    async createCredential({ challenge }) {
+      const payment = await node.payInvoice({
+        invoice: challenge.request.methodDetails.invoice,
+      });
+      if (payment.type !== "payment_sent")
+        throw new Error("Fixture payment failed");
+      return Credential.serialize({
+        challenge,
+        payload: { preimage: payment.paymentPreimage },
+      });
+    },
+  });
 }

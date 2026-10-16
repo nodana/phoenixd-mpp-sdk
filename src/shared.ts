@@ -3,17 +3,16 @@ import type { DecodedInvoice } from "@nodana/phoenixd-ts";
 import type { ChargeRequest, LightningNetwork } from "./Methods";
 
 export function satoshis(amount: string): number {
-  if (!/^[1-9][0-9]*$/.test(amount))
+  if (typeof amount !== "string" || !/^[1-9][0-9]*$/.test(amount))
     throw new TypeError("amount must be a positive integer string in satoshis");
 
-  const value = Number(amount);
-
-  if (!Number.isSafeInteger(value * 1000))
+  const value = BigInt(amount);
+  if (value * 1000n > BigInt(Number.MAX_SAFE_INTEGER))
     throw new TypeError(
       "amount exceeds the safely representable millisatoshi range",
     );
-
-  return value;
+  // Phoenixd's HTTP client expects a number; conversion is exact after the bound check.
+  return Number(value);
 }
 
 export function paymentHash(preimage: string): string {
@@ -30,9 +29,13 @@ export function invoiceDetails(
   request: Pick<ChargeRequest, "amount" | "currency">,
   expected?: LightningNetwork,
 ): { paymentHash: string; network: LightningNetwork; expiresAt: number } {
+  satoshis(request.amount);
   if (
     request.currency !== "sat" ||
-    invoice.amount !== satoshis(request.amount) * 1000
+    !Number.isSafeInteger(invoice.amount) ||
+    (invoice.amount !== undefined &&
+      invoice.amount !== null &&
+      BigInt(invoice.amount) !== BigInt(request.amount) * 1000n)
   )
     throw new TypeError("Invoice amount does not match the requested satoshis");
 
